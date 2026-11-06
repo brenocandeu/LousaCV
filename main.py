@@ -20,12 +20,13 @@ FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 BRUSH_COLOR = (0, 0, 255)  # Vermelho vibrante (BGR)
 BRUSH_THICKNESS = 12
+ERASER_RADIUS = 45
 SMOOTHING_ALPHA = 0.55  # Equilibrio entre fluidez e resposta rapida
-DRAW_GRACE_SEC = 0.20   # Tolerancia (200ms) contra falhas rapidas de iluminacao no desenho
+DRAW_GRACE_SEC = 0.20   # Tolerancia (200ms) contra micro-falhas de iluminacao no desenho
 
 
 class CameraStream:
-    """Captura frames da webcam em thread dedicada para nao travar o FPS da interface."""
+    """Captura frames da webcam em thread dedicada para manter o FPS alto em qualquer hardware."""
 
     def __init__(self, src: int = 0, width: int = 1280, height: int = 720) -> None:
         self.width = width
@@ -89,8 +90,8 @@ class CameraStream:
 
 class HandTracker:
     """
-    Rastreador assincrono (LIVE_STREAM) com realce automatico de iluminacao (Gamma + CLAHE)
-    e escala adaptativa para rodar liso tanto em PCs potentes quanto em notebooks basicos.
+    Rastreador 3D assincrono (LIVE_STREAM) com realce de iluminacao (Gamma + CLAHE)
+    e reconhecimento ergonomico invariante ao angulo da mao (nao exige apontar para cima).
     """
 
     HAND_CONNECTIONS = (
@@ -100,13 +101,11 @@ class HandTracker:
         (9, 13), (13, 14), (14, 15), (15, 16),
         (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
     )
-    PALM_IDS = (0, 5, 9, 13, 17)
 
     def __init__(self, max_hands: int = 1) -> None:
         self._ensure_model()
         model_bytes = MODEL_PATH.read_bytes()
 
-        # Limiares mais tolerantes para nao perder o indicador em sombras ou movimento rapido
         options = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_buffer=model_bytes),
             running_mode=vision.RunningMode.LIVE_STREAM,
@@ -118,20 +117,20 @@ class HandTracker:
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
 
-        # Realce fotometrico leve para salas escuras (ex: sala com projetor ligado) ou contra-luz
         self._clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         self._dark_gamma_lut = np.array(
             [((i / 255.0) ** 0.65) * 255 for i in range(256)], dtype=np.uint8
         )
 
         self._lock = threading.Lock()
-        self._landmarks = None
+        self._landmarks_2d = None
+        self._landmarks_3d = None
         self._result_seq = 0
         self._busy = False
         self._last_ts_ms = 0
         self._infer_start_t = 0.0
         self._avg_infer_ms = 15.0
-        self._infer_size = (640, 360)  # Ajusta automaticamente se o hardware for mais fraco
+        self._infer_size = (640, 360)
 
     @staticmethod
     def _ensure_model() -> None:
@@ -144,29 +143,28 @@ class HandTracker:
         dt_ms = (time.perf_counter() - self._infer_start_t) * 1000.0
         self._avg_infer_ms = 0.85 * self._avg_infer_ms + 0.15 * dt_ms
 
-        # Escala adaptativa de hardware: reduz resolucao interna em CPUs mais lentas
         if self._avg_infer_ms > 32.0:
             self._infer_size = (448, 252)
         elif self._avg_infer_ms < 18.0:
             self._infer_size = (640, 360)
 
-        lms = result.hand_landmarks[0] if (result and result.hand_landmarks) else None
+        lms_2d = result.hand_landmarks[0] if (result and result.hand_landmarks) else None
+        lms_3d = result.hand_world_landmarks[0] if (result and result.hand_world_landmarks) else None
+
         with self._lock:
-            self._landmarks = lms
+            self._landmarks_2d = lms_2d
+            self._landmarks_3d = lms_3d
             self._result_seq += 1
             self._busy = False
 
     def submit_frame(self, frame_bgr: np.ndarray) -> None:
-        """Envia o frame para inferencia em background sem bloquear a renderizacao."""
         with self._lock:
             if self._busy:
                 return
             self._busy = True
 
-        # Redimensiona copia pequena para a IA (desenho na tela continua em HD 1280x720)
         small = cv2.resize(frame_bgr, self._infer_size, interpolation=cv2.INTER_LINEAR)
 
-        # Normaliza iluminacao no canal Y (corrige ambiente escuro e melhora contraste dos dedos)
         ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
         y_chan = ycrcb[:, :, 0]
         if float(np.mean(y_chan)) < 90.0:
@@ -186,54 +184,98 @@ class HandTracker:
                 self._busy = False
 
     def get_snapshot(self):
-        """Retorna (landmarks_atuais, sequencia_resultado) de forma thread-safe."""
+        """Retorna (landmarks_2d, landmarks_3d, sequencia) de forma thread-safe."""
         with self._lock:
-            return self._landmarks, self._result_seq
+            return self._landmarks_2d, self._landmarks_3d, self._result_seq
 
     @staticmethod
-    def _dist(lms, a: int, b: int) -> float:
-        return math.hypot(lms[a].x - lms[b].x, lms[a].y - lms[b].y)
-
-    @classmethod
-    def get_fingers_up(cls, lms) -> list[bool]:
-        """
-        Retorna [polegar, indicador, medio, anelar, mindinho].
-        Combina posicao vertical com distancia ao punho para funcionar mesmo com a mao inclinada.
-        """
-        palm = max(cls._dist(lms, 0, 9), 1e-6)
-
-        # Polegar aberto: ponta (4) afastada da base do mindinho (17) e da base do indicador (5)
-        thumb_up = (
-            cls._dist(lms, 4, 17) > cls._dist(lms, 3, 17) * 1.04
-            and cls._dist(lms, 4, 5) > 0.32 * palm
+    def _dist3(w, a: int, b: int) -> float:
+        return math.sqrt(
+            (w[a].x - w[b].x) ** 2 + (w[a].y - w[b].y) ** 2 + (w[a].z - w[b].z) ** 2
         )
 
-        # Indicador mais tolerante a inclinacao lateral ao escrever e leve perspectiva frontal
-        ind_up = (
-            (lms[8].y < lms[6].y + 0.015 and cls._dist(lms, 0, 8) > cls._dist(lms, 0, 6) * 1.03)
-            or (cls._dist(lms, 0, 8) > cls._dist(lms, 0, 6) * 1.13 and lms[8].y < lms[5].y + 0.025)
-        )
-
-        # Medio, Anelar e Mindinho exigem extensao clara para evitar falsos positivos
-        med_up = (lms[12].y < lms[10].y) and (cls._dist(lms, 0, 12) > cls._dist(lms, 0, 10) * 1.08)
-        ane_up = (lms[16].y < lms[14].y) and (cls._dist(lms, 0, 16) > cls._dist(lms, 0, 14) * 1.08)
-        min_up = (lms[20].y < lms[18].y) and (cls._dist(lms, 0, 20) > cls._dist(lms, 0, 18) * 1.06)
-
-        return [thumb_up, ind_up, med_up, ane_up, min_up]
+    @staticmethod
+    def _finger_cos3(w, mcp: int, pip: int, tip: int) -> float:
+        """Cosseno do angulo 3D entre a base (MCP->PIP) e a ponta (PIP->TIP) do dedo."""
+        v1x, v1y, v1z = w[pip].x - w[mcp].x, w[pip].y - w[mcp].y, w[pip].z - w[mcp].z
+        v2x, v2y, v2z = w[tip].x - w[pip].x, w[tip].y - w[pip].y, w[tip].z - w[pip].z
+        n1 = math.sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
+        n2 = math.sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return -1.0
+        return (v1x * v2x + v1y * v2y + v1z * v2z) / (n1 * n2)
 
     @classmethod
-    def get_palm_eraser(cls, lms, width: int, height: int) -> tuple[int, int, int]:
-        """Calcula o centro exato da palma da mao e um raio proporcional para a borracha."""
-        px = int(sum(lms[idx].x for idx in cls.PALM_IDS) / len(cls.PALM_IDS) * width)
-        py = int(sum(lms[idx].y for idx in cls.PALM_IDS) / len(cls.PALM_IDS) * height)
+    def _is_extended_3d(
+        cls, w, mcp: int, pip: int, tip: int, cos_min: float = 0.50, ratio_min: float = 1.10
+    ) -> bool:
+        """
+        Verifica se o dedo esta esticado usando coordenadas 3D reais da mao.
+        Funciona em QUALQUER angulo: deitado de lado, apontando para a tela ou para cima!
+        """
+        return (
+            cls._finger_cos3(w, mcp, pip, tip) > cos_min
+            and cls._dist3(w, 0, tip) > cls._dist3(w, 0, pip) * ratio_min
+        )
 
-        palm_px = math.hypot((lms[9].x - lms[0].x) * width, (lms[9].y - lms[0].y) * height)
-        radius = int(max(45, min(85, palm_px * 0.55)))
-        return px, py, radius
+    @classmethod
+    def classify_gesture(
+        cls, lms2d, w3d, width: int, height: int
+    ) -> tuple[str, tuple[float, float]]:
+        """
+        Classifica o gesto ergonomico da mao e retorna (modo, ponto_referencia_xy):
+        - 'DRAW':
+            1) Indicador estendido em qualquer angulo 3D (deitado na horizontal, apontando
+               reto para o monitor com o cotovelo apoiado na mesa, ou na diagonal); OU
+            2) Gesto de 'Segurar Caneta' (pinca: polegar encostado na ponta do indicador),
+               permitindo escrever com a mao 100% relaxada sem forcar os outros dedos!
+        - 'FREE': Indicador + Medio estendidos (em qualquer angulo).
+        - 'ERASE': 4 dedos estendidos (Indicador + Medio + Anelar + Mindinho), como antes.
+        - 'PAUSED': Mao fechada ou em repouso.
+        """
+        # Avalia extensao 3D dos 4 dedos independente da rotacao do pulso
+        ind_ext = cls._is_extended_3d(w3d, 5, 6, 8, cos_min=0.35, ratio_min=1.05)
+        med_ext = cls._is_extended_3d(w3d, 9, 10, 12, cos_min=0.55, ratio_min=1.10)
+        ane_ext = cls._is_extended_3d(w3d, 13, 14, 16, cos_min=0.55, ratio_min=1.10)
+        min_ext = cls._is_extended_3d(w3d, 17, 18, 20, cos_min=0.50, ratio_min=1.08)
+
+        # Detecta pega ergonomica de caneta/giz (pinca entre polegar 4 e indicador 8)
+        palm_2d = max(math.hypot(lms2d[9].x - lms2d[0].x, lms2d[9].y - lms2d[0].y), 1e-6)
+        pinch_2d = math.hypot(lms2d[4].x - lms2d[8].x, lms2d[4].y - lms2d[8].y) < 0.35 * palm_2d
+        pinch_3d = cls._dist3(w3d, 4, 8) < 0.035
+        not_fist = (
+            cls._dist3(w3d, 0, 8) > cls._dist3(w3d, 0, 5) * 1.18
+            and cls._finger_cos3(w3d, 5, 6, 8) > 0.15
+        )
+        pen_pinch = pinch_2d and pinch_3d and not_fist and not (med_ext and ane_ext and min_ext)
+
+        # 1) BORRACHA: 4 dedos levantados/estendidos (indicador, medio, anelar e mindinho)
+        if ind_ext and med_ext and ane_ext and min_ext and not pen_pinch:
+            ex = sum(lms2d[idx].x for idx in (8, 12, 16, 20)) * 0.25 * width
+            ey = sum(lms2d[idx].y for idx in (8, 12, 16, 20)) * 0.25 * height
+            return "ERASE", (ex, ey)
+
+        # 2) MODO LIVRE: 2 dedos estendidos (indicador + medio) sem pinca
+        if ind_ext and med_ext and not ane_ext and not min_ext and not pen_pinch:
+            cx = (lms2d[8].x + lms2d[12].x) * 0.5 * width
+            cy = (lms2d[8].y + lms2d[12].y) * 0.5 * height
+            return "FREE", (cx, cy)
+
+        # 3) DESENHO ERGONOMICO: Pega de caneta (pinca) OU indicador apontado em qualquer angulo 3D
+        if pen_pinch:
+            px = (lms2d[8].x + lms2d[4].x) * 0.5 * width
+            py = (lms2d[8].y + lms2d[4].y) * 0.5 * height
+            return "DRAW_PEN", (px, py)
+
+        if ind_ext and not med_ext and not ane_ext and not min_ext:
+            ix = lms2d[8].x * width
+            iy = lms2d[8].y * height
+            return "DRAW_INDEX", (ix, iy)
+
+        return "PAUSED", (lms2d[8].x * width, lms2d[8].y * height)
 
     @classmethod
     def draw_landmarks_fast(cls, frame: np.ndarray, lms) -> None:
-        """Desenho leve dos 21 pontos em OpenCV puro (~20x mais rapido que drawing_utils)."""
         if lms is None:
             return
         h, w, _ = frame.shape
@@ -283,23 +325,21 @@ def main() -> None:
             if not ok or frame is None:
                 continue
 
-            # Envia para a IA apenas quando chegar um frame novo da camera
             if frame_id != last_submitted_frame_id:
                 tracker.submit_frame(frame)
                 last_submitted_frame_id = frame_id
 
-            lms, seq = tracker.get_snapshot()
+            lms2d, w3d, seq = tracker.get_snapshot()
             now = time.perf_counter()
 
-            # Atualiza estado logico e tracos quando chega resultado novo da IA
             if seq != last_processed_seq:
                 last_processed_seq = seq
 
-                if lms is not None:
-                    thumb_up, ind_up, med_up, ane_up, min_up = tracker.get_fingers_up(lms)
+                if lms2d is not None and w3d is not None:
+                    gesture, (raw_x, raw_y) = tracker.classify_gesture(
+                        lms2d, w3d, FRAME_WIDTH, FRAME_HEIGHT
+                    )
 
-                    raw_x = lms[8].x * FRAME_WIDTH
-                    raw_y = lms[8].y * FRAME_HEIGHT
                     if smooth_pt is None:
                         smooth_pt = (raw_x, raw_y)
                     else:
@@ -307,77 +347,74 @@ def main() -> None:
                             SMOOTHING_ALPHA * raw_x + (1.0 - SMOOTHING_ALPHA) * smooth_pt[0],
                             SMOOTHING_ALPHA * raw_y + (1.0 - SMOOTHING_ALPHA) * smooth_pt[1],
                         )
-                    ix, iy = int(smooth_pt[0]), int(smooth_pt[1])
+                    sx, sy = int(smooth_pt[0]), int(smooth_pt[1])
 
-                    # 1) MODO DESENHO: Apenas indicador levantado (polegar livre)
-                    if ind_up and not med_up and not ane_up and not min_up:
-                        mode_label = "DESENHO (Indicador)"
+                    # 1) MODO DESENHO: Indicador em qualquer angulo 3D OU Pega de Caneta (Pinca)
+                    if gesture in ("DRAW_INDEX", "DRAW_PEN"):
+                        mode_label = (
+                            "DESENHO (Caneta/Pinca)"
+                            if gesture == "DRAW_PEN"
+                            else "DESENHO (Indicador Livre 3D)"
+                        )
                         non_draw_streak = 0
                         last_draw_seen_t = now
                         prev_erase_pt = None
 
                         if prev_draw_pt is not None:
-                            # Evita ligar pontos distantes caso a mao tenha saltado na tela
-                            jump = math.hypot(ix - prev_draw_pt[0], iy - prev_draw_pt[1])
-                            if jump > 180:
+                            if math.hypot(sx - prev_draw_pt[0], sy - prev_draw_pt[1]) > 180:
                                 prev_draw_pt = None
 
                         if prev_draw_pt is None:
-                            cv2.circle(canvas, (ix, iy), BRUSH_THICKNESS // 2, BRUSH_COLOR, cv2.FILLED)
-                            cv2.circle(canvas_mask, (ix, iy), BRUSH_THICKNESS // 2, 255, cv2.FILLED)
+                            cv2.circle(canvas, (sx, sy), BRUSH_THICKNESS // 2, BRUSH_COLOR, cv2.FILLED)
+                            cv2.circle(canvas_mask, (sx, sy), BRUSH_THICKNESS // 2, 255, cv2.FILLED)
                         else:
-                            cv2.line(canvas, prev_draw_pt, (ix, iy), BRUSH_COLOR, BRUSH_THICKNESS)
-                            cv2.line(canvas_mask, prev_draw_pt, (ix, iy), 255, BRUSH_THICKNESS)
+                            cv2.line(canvas, prev_draw_pt, (sx, sy), BRUSH_COLOR, BRUSH_THICKNESS)
+                            cv2.line(canvas_mask, prev_draw_pt, (sx, sy), 255, BRUSH_THICKNESS)
 
-                        prev_draw_pt = (ix, iy)
-                        overlay_cursor = ("DRAW", (ix, iy), 10)
+                        prev_draw_pt = (sx, sy)
+                        overlay_cursor = ("DRAW", (sx, sy), 10)
 
-                    # 2) MODO BORRACHA: Palma da mao aberta (os 5 dedos levantados)
-                    elif thumb_up and ind_up and med_up and ane_up and min_up:
+                    # 2) MODO BORRACHA: 4 dedos estendidos (como estava antes)
+                    elif gesture == "ERASE":
                         non_draw_streak += 1
                         if non_draw_streak >= 2 or prev_draw_pt is None:
-                            mode_label = "BORRACHA (Palma - 5 Dedos)"
+                            mode_label = "BORRACHA (4 Dedos)"
                             prev_draw_pt = None
+                            ex, ey = int(raw_x), int(raw_y)
 
-                            px, py, radius = tracker.get_palm_eraser(lms, FRAME_WIDTH, FRAME_HEIGHT)
-                            cv2.circle(canvas, (px, py), radius, (0, 0, 0), cv2.FILLED)
-                            cv2.circle(canvas_mask, (px, py), radius, 0, cv2.FILLED)
+                            cv2.circle(canvas, (ex, ey), ERASER_RADIUS, (0, 0, 0), cv2.FILLED)
+                            cv2.circle(canvas_mask, (ex, ey), ERASER_RADIUS, 0, cv2.FILLED)
 
                             if prev_erase_pt is not None:
-                                cv2.line(canvas, prev_erase_pt, (px, py), (0, 0, 0), radius * 2)
-                                cv2.line(canvas_mask, prev_erase_pt, (px, py), 0, radius * 2)
+                                cv2.line(canvas, prev_erase_pt, (ex, ey), (0, 0, 0), ERASER_RADIUS * 2)
+                                cv2.line(canvas_mask, prev_erase_pt, (ex, ey), 0, ERASER_RADIUS * 2)
 
-                            prev_erase_pt = (px, py)
-                            overlay_cursor = ("ERASE", (px, py), radius)
+                            prev_erase_pt = (ex, ey)
+                            overlay_cursor = ("ERASE", (ex, ey), ERASER_RADIUS)
 
-                    # 3) MODO LIVRE: Indicador e dedo medio em pe
-                    elif ind_up and med_up and not ane_up and not min_up:
+                    # 3) MODO LIVRE: 2 dedos estendidos (indicador + medio)
+                    elif gesture == "FREE":
                         non_draw_streak += 1
                         if non_draw_streak >= 2 or prev_draw_pt is None:
                             mode_label = "LIVRE (2 Dedos)"
                             prev_draw_pt = None
                             prev_erase_pt = None
-
-                            mx = int(lms[12].x * FRAME_WIDTH)
-                            my = int(lms[12].y * FRAME_HEIGHT)
-                            cx, cy = (ix + mx) // 2, (iy + my) // 2
+                            cx, cy = int(raw_x), int(raw_y)
                             overlay_cursor = ("FREE", (cx, cy), 10)
 
-                    # Outras poses (ex: mao fechada ou transicao rapida)
+                    # Mao fechada / soltou a pinca -> pausa o traco
                     else:
                         prev_erase_pt = None
-                        # Mantem o traco vivo por ate 200ms contra falhas rapidas de luz/leitura
-                        if prev_draw_pt is not None and (now - last_draw_seen_t) <= DRAW_GRACE_SEC:
-                            mode_label = "DESENHO (Indicador)"
+                        non_draw_streak += 1
+                        if prev_draw_pt is not None and (now - last_draw_seen_t) <= DRAW_GRACE_SEC and non_draw_streak < 3:
                             overlay_cursor = ("DRAW", prev_draw_pt, 10)
                         else:
-                            mode_label = "PAUSADO"
+                            mode_label = "LIVRE / PAUSADO"
                             prev_draw_pt = None
-                            overlay_cursor = None
+                            overlay_cursor = ("FREE", (int(raw_x), int(raw_y)), 8)
                 else:
                     prev_erase_pt = None
                     if prev_draw_pt is not None and (now - last_draw_seen_t) <= DRAW_GRACE_SEC:
-                        # Segura a conexao do traco caso a mao pisque por 1-3 frames na contraluz
                         overlay_cursor = ("DRAW", prev_draw_pt, 10)
                     else:
                         mode_label = "AGUARDANDO MAO"
@@ -385,11 +422,10 @@ def main() -> None:
                         smooth_pt = None
                         overlay_cursor = None
 
-            # Fusao ultra-rapida O(1) in-place usando mascara binaria (0.03 ms/frame!)
+            # Fusao ultra-rapida O(1) in-place (0.03 ms/frame)
             cv2.copyTo(canvas, canvas_mask, frame)
 
-            # Renderiza esqueleto leve da mao e cursor do modo ativo
-            tracker.draw_landmarks_fast(frame, lms)
+            tracker.draw_landmarks_fast(frame, lms2d)
 
             if overlay_cursor is not None:
                 kind, (cx, cy), rad = overlay_cursor
@@ -399,9 +435,7 @@ def main() -> None:
                     cv2.circle(frame, (cx, cy), rad, (255, 255, 0), 2)
                 elif kind == "ERASE":
                     cv2.circle(frame, (cx, cy), rad, (255, 255, 255), 2)
-                    cv2.circle(frame, (cx, cy), 4, (255, 255, 255), cv2.FILLED)
 
-            # Calculo suavizado de FPS para leitura estavel
             curr_time = time.perf_counter()
             inst_fps = 1.0 / max(curr_time - prev_time, 1e-6)
             prev_time = curr_time
@@ -420,7 +454,6 @@ def main() -> None:
 
             cv2.imshow(window_name, frame)
 
-            # Se nenhum frame novo chegou ainda da camera, aguarda 1ms sem consumir 100% da CPU
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 break
