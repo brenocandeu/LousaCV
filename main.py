@@ -21,6 +21,7 @@ FRAME_HEIGHT = 720
 ERASER_RADIUS = 45
 SMOOTHING_ALPHA = 0.55  # Equilibrio entre fluidez e resposta rapida
 DRAW_GRACE_SEC = 0.20   # Tolerancia (200ms) contra micro-falhas de iluminacao no desenho
+HOLD_SNAP_SEC = 0.42    # Tempo segurando o dedo parado no fim do traco para converter igual ao Canva
 
 
 class CameraStream:
@@ -218,19 +219,9 @@ class HandTracker:
     def classify_gesture(
         cls, lms2d, w3d, width: int, height: int
     ) -> tuple[str, tuple[float, float]]:
-        """
-        Classifica o gesto 3D da mao e retorna (modo, ponto_xy):
-        - 'DRAW_INDEX' / 'DRAW_PEN': 1 dedo em qualquer angulo 3D OU Pinca (Caneta).
-        - 'FREE': 2 dedos (Indicador + Medio) -> Mover cursor livremente sem clicar.
-        - 'CLICK': 3 dedos (Indicador + Medio + Anelar) -> Simula clique/arraste no menu!
-          Nota: usa a mesma ancora (Indicador + Medio)/2 do modo FREE para o cursor nao pular ao clicar!
-        - 'ERASE': 4 dedos (Indicador + Medio + Anelar + Mindinho) -> Borracha.
-        - 'PAUSED': Mao fechada ou em repouso.
-        """
         ind_ext = cls._is_extended_3d(w3d, 5, 6, 8, cos_min=0.35, ratio_min=1.05)
         med_ext = cls._is_extended_3d(w3d, 9, 10, 12, cos_min=0.50, ratio_min=1.08)
         ane_ext = cls._is_extended_3d(w3d, 13, 14, 16, cos_min=0.45, ratio_min=1.07)
-        # Mindinho exige extensao bem clara para nao confundir 3 dedos (clique) com 4 dedos (borracha)
         min_ext = cls._is_extended_3d(w3d, 17, 18, 20, cos_min=0.68, ratio_min=1.13)
 
         palm_2d = max(math.hypot(lms2d[9].x - lms2d[0].x, lms2d[9].y - lms2d[0].y), 1e-6)
@@ -242,25 +233,20 @@ class HandTracker:
         )
         pen_pinch = pinch_2d and pinch_3d and not_fist and not (med_ext and ane_ext)
 
-        # Ancora estavel do cursor (ponto medio entre indicador e medio: nao desloca ao levantar o 3o dedo!)
         cursor_x = (lms2d[8].x + lms2d[12].x) * 0.5 * width
         cursor_y = (lms2d[8].y + lms2d[12].y) * 0.5 * height
 
-        # 1) BORRACHA: 4 dedos claramente estendidos
         if ind_ext and med_ext and ane_ext and min_ext and not pen_pinch:
             ex = sum(lms2d[idx].x for idx in (8, 12, 16, 20)) * 0.25 * width
             ey = sum(lms2d[idx].y for idx in (8, 12, 16, 20)) * 0.25 * height
             return "ERASE", (ex, ey)
 
-        # 2) CLIQUE / SELECAO NO MENU: 3 dedos estendidos (indicador + medio + anelar)
         if ind_ext and med_ext and ane_ext and not min_ext and not pen_pinch:
             return "CLICK", (cursor_x, cursor_y)
 
-        # 3) MODO LIVRE (HOVER): 2 dedos estendidos (indicador + medio)
         if ind_ext and med_ext and not ane_ext and not min_ext and not pen_pinch:
             return "FREE", (cursor_x, cursor_y)
 
-        # 4) DESENHO ERGONOMICO: Pinca (Caneta) OU Indicador livre em 360 graus
         if pen_pinch:
             px = (lms2d[8].x + lms2d[4].x) * 0.5 * width
             py = (lms2d[8].y + lms2d[4].y) * 0.5 * height
@@ -289,11 +275,314 @@ class HandTracker:
         self.detector.close()
 
 
+class ShapeRecognizer:
+    """
+    Motor Inteligente de Formas estilo Canva:
+    Transforma tracos com oscilacoes em Linhas Retas, Setas (1 ou 2 tracos),
+    Triangulos, Quadrados, Retangulos, Losangos, Pentagonos, Hexagonos e Circulos.
+    """
+
+    # Guarda a ultima reta desenhada (p0, pn, timestamp) para suportar setas feitas em 2 tracos
+    _last_line: tuple[tuple[int, int], tuple[int, int], float] | None = None
+
+    @staticmethod
+    def draw_freehand(
+        canvas: np.ndarray,
+        mask: np.ndarray,
+        stroke: list[tuple[int, int]],
+        color: tuple[int, int, int],
+        thickness: int,
+    ) -> None:
+        if not stroke:
+            return
+        if len(stroke) == 1:
+            r = max(1, thickness // 2)
+            cv2.circle(canvas, stroke[0], r, color, cv2.FILLED)
+            cv2.circle(mask, stroke[0], r, 255, cv2.FILLED)
+            return
+        pts = np.array(stroke, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+        cv2.polylines(mask, [pts], isClosed=False, color=255, thickness=thickness)
+
+    @staticmethod
+    def _max_perp_dev(pts: np.ndarray, p0: tuple[int, int], pn: tuple[int, int]) -> float:
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(pn[0]), float(pn[1])
+        dx, dy = x1 - x0, y1 - y0
+        norm = math.hypot(dx, dy)
+        if norm < 1e-5:
+            return 0.0
+        devs = np.abs(dy * pts[:, 0] - dx * pts[:, 1] + x1 * y0 - y1 * x0) / norm
+        return float(np.max(devs))
+
+    @staticmethod
+    def _level_line(p0: tuple[int, int], pn: tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Alinha automaticamente linhas quase horizontais ou verticais (< 4.5 graus)."""
+        dx = pn[0] - p0[0]
+        dy = pn[1] - p0[1]
+        if abs(dx) > 35 and abs(dy) / max(abs(dx), 1) < 0.08:
+            ym = (p0[1] + pn[1]) // 2
+            return (p0[0], ym), (pn[0], ym)
+        if abs(dy) > 35 and abs(dx) / max(abs(dy), 1) < 0.08:
+            xm = (p0[0] + pn[0]) // 2
+            return (xm, p0[1]), (xm, pn[1])
+        return p0, pn
+
+    @staticmethod
+    def _draw_arrow_head(
+        canvas: np.ndarray,
+        mask: np.ndarray,
+        p_from: tuple[int, int],
+        p_tip: tuple[int, int],
+        color: tuple[int, int, int],
+        thickness: int,
+    ) -> None:
+        dx = float(p_tip[0] - p_from[0])
+        dy = float(p_tip[1] - p_from[1])
+        length = math.hypot(dx, dy)
+        if length < 1e-3:
+            return
+        ux, uy = dx / length, dy / length
+        head_len = max(24.0, min(54.0, length * 0.22 + thickness * 1.3))
+        angle = math.radians(28.0)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        bx, by = -ux, -uy
+
+        w1 = (
+            int(round(p_tip[0] + head_len * (bx * cos_a - by * sin_a))),
+            int(round(p_tip[1] + head_len * (bx * sin_a + by * cos_a))),
+        )
+        w2 = (
+            int(round(p_tip[0] + head_len * (bx * cos_a + by * sin_a))),
+            int(round(p_tip[1] + head_len * (-bx * sin_a + by * cos_a))),
+        )
+        wings = np.array([w1, p_tip, w2], dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(canvas, [wings], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+        cv2.polylines(mask, [wings], isClosed=False, color=255, thickness=thickness)
+
+    @classmethod
+    def _detect_arrow_one_stroke(cls, pts: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Detecta seta desenhada em 1 unico traco continuo (haste reta + gancho/ponta no final)."""
+        p0 = (int(pts[0, 0]), int(pts[0, 1]))
+        dists_p0 = np.hypot(pts[:, 0] - p0[0], pts[:, 1] - p0[1])
+        tip_idx = int(np.argmax(dists_p0))
+        max_dist = float(dists_p0[tip_idx])
+
+        if max_dist < 65.0 or tip_idx < 8 or tip_idx >= len(pts) - 4:
+            return None
+
+        shaft_pts = pts[: tip_idx + 1]
+        tail_pts = pts[tip_idx:]
+        shaft_diffs = np.diff(shaft_pts, axis=0)
+        shaft_len = float(np.sum(np.hypot(shaft_diffs[:, 0], shaft_diffs[:, 1])))
+        tail_diffs = np.diff(tail_pts, axis=0)
+        tail_len = float(np.sum(np.hypot(tail_diffs[:, 0], tail_diffs[:, 1])))
+
+        if shaft_len < 60.0:
+            return None
+
+        p_tip = (int(pts[tip_idx, 0]), int(pts[tip_idx, 1]))
+        shaft_straight = max_dist / shaft_len
+        shaft_dev = cls._max_perp_dev(shaft_pts, p0, p_tip) / max(max_dist, 1.0)
+        max_tail_spread = float(np.max(np.hypot(tail_pts[:, 0] - p_tip[0], tail_pts[:, 1] - p_tip[1])))
+        end_back_dist = float(math.hypot(pts[-1, 0] - p_tip[0], pts[-1, 1] - p_tip[1]))
+
+        if (
+            shaft_straight >= 0.78
+            and shaft_dev <= 0.14
+            and (0.07 * shaft_len <= tail_len <= 0.80 * shaft_len)
+            and max_tail_spread <= 0.45 * max_dist
+            and end_back_dist >= 14.0
+        ):
+            return cls._level_line(p0, p_tip)
+        return None
+
+    @classmethod
+    def _detect_arrow_two_strokes(
+        cls, pts: np.ndarray, path_len: float, direct_dist: float
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """
+        Detecta quando o usuario desenhou uma reta antes e agora fez o 'V' da ponta da seta
+        perto de uma das extremidades da reta!
+        """
+        if cls._last_line is None:
+            return None
+        l_p0, l_pn, l_time = cls._last_line
+        if (time.perf_counter() - l_time) > 12.0:
+            return None
+
+        if not (28.0 <= path_len <= 380.0 and 0.25 <= (direct_dist / path_len) <= 0.84):
+            return None
+
+        # Verifica se o vertice central (dobradura do 'V') esta proximo de l_pn ou l_p0
+        approx = cv2.approxPolyDP(pts.astype(np.int32).reshape((-1, 1, 2)), 0.08 * path_len, closed=False)
+        if len(approx) < 3 or len(approx) > 5:
+            return None
+
+        # Ponto do traco mais proximo das pontas da reta anterior
+        d_to_pn = float(np.min(np.hypot(pts[:, 0] - l_pn[0], pts[:, 1] - l_pn[1])))
+        d_to_p0 = float(np.min(np.hypot(pts[:, 0] - l_p0[0], pts[:, 1] - l_p0[1])))
+
+        if d_to_pn <= 60.0 and d_to_pn <= d_to_p0:
+            return l_p0, l_pn
+        if d_to_p0 <= 60.0:
+            return l_pn, l_p0
+        return None
+
+    @classmethod
+    def process_and_draw(
+        cls,
+        canvas: np.ndarray,
+        mask: np.ndarray,
+        stroke: list[tuple[int, int]],
+        color: tuple[int, int, int],
+        thickness: int,
+        assist_enabled: bool = True,
+    ) -> str:
+        if not stroke:
+            return "NONE"
+
+        if not assist_enabled or len(stroke) < 10:
+            cls.draw_freehand(canvas, mask, stroke, color, thickness)
+            return "LIVRE"
+
+        pts = np.array(stroke, dtype=np.float32)
+        diffs = np.diff(pts, axis=0)
+        path_len = float(np.sum(np.hypot(diffs[:, 0], diffs[:, 1])))
+
+        if path_len < 32.0:
+            cls.draw_freehand(canvas, mask, stroke, color, thickness)
+            return "LIVRE"
+
+        p0 = stroke[0]
+        pn = stroke[-1]
+        direct_dist = math.hypot(pn[0] - p0[0], pn[1] - p0[1])
+
+        # 1) SETA EM 1 TRACO CONTINUO (haste + ponta)
+        arrow_1 = cls._detect_arrow_one_stroke(pts)
+        if arrow_1 is not None:
+            a_start, a_tip = arrow_1
+            cv2.line(canvas, a_start, a_tip, color, thickness, cv2.LINE_AA)
+            cv2.line(mask, a_start, a_tip, 255, thickness)
+            cls._draw_arrow_head(canvas, mask, a_start, a_tip, color, thickness)
+            cls._last_line = None
+            return "SETA"
+
+        # 2) SETA EM 2 TRACOS (ponta 'V' adicionada na extremidade da ultima reta)
+        arrow_2 = cls._detect_arrow_two_strokes(pts, path_len, direct_dist)
+        if arrow_2 is not None:
+            a_from, a_tip = arrow_2
+            cls._draw_arrow_head(canvas, mask, a_from, a_tip, color, thickness)
+            cls._last_line = None
+            return "SETA"
+
+        # 3) LINHA RETA (corrige linhas com oscilacoes e tortas igual ao Canva)
+        max_dev = cls._max_perp_dev(pts, p0, pn)
+        if direct_dist >= 35.0 and (direct_dist / path_len) >= 0.74 and (max_dev / direct_dist) <= 0.14:
+            lp0, lpn = cls._level_line(p0, pn)
+            cv2.line(canvas, lp0, lpn, color, thickness, cv2.LINE_AA)
+            cv2.line(mask, lp0, lpn, 255, thickness)
+            cls._last_line = (lp0, lpn, time.perf_counter())
+            return "LINHA RETA"
+
+        # 4) FORMAS GEOMETRICAS FECHADAS (Triangulo, Quadrado, Retangulo, Losango, Pentagono, Circulo)
+        k = max(3, len(pts) // 5)
+        end_dists = np.hypot(pts[:k, None, 0] - pts[-k:, 0], pts[:k, None, 1] - pts[-k:, 1])
+        min_end_gap = float(np.min(end_dists))
+        is_closed = ((direct_dist / path_len) <= 0.32) or ((min_end_gap / path_len) <= 0.15)
+
+        if is_closed and path_len >= 85.0:
+            poly_pts = pts.astype(np.int32).reshape((-1, 1, 2))
+            # Usa o Convex Hull para eliminar oscilacoes internas das paredes desenhadas no ar
+            hull = cv2.convexHull(poly_pts)
+            hull_area = cv2.contourArea(hull)
+            hull_peri = cv2.arcLength(hull, True)
+
+            if hull_area >= 500.0 and hull_peri > 0:
+                circularity = (4.0 * math.pi * hull_area) / (hull_peri * hull_peri)
+                approx = cv2.approxPolyDP(hull, 0.038 * hull_peri, True)
+                num_verts = len(approx)
+
+                # TRIANGULO (3 vertices)
+                if num_verts == 3:
+                    tri = approx.reshape(3, 2)
+                    # Nivela a base caso dois vertices estejam quase na mesma altura
+                    for i in range(3):
+                        j = (i + 1) % 3
+                        dx_t = abs(int(tri[i, 0]) - int(tri[j, 0]))
+                        dy_t = abs(int(tri[i, 1]) - int(tri[j, 1]))
+                        if dx_t > 30 and dy_t / max(dx_t, 1) < 0.09:
+                            ym = (int(tri[i, 1]) + int(tri[j, 1])) // 2
+                            tri[i, 1] = ym
+                            tri[j, 1] = ym
+                    tri_pts = tri.reshape((-1, 1, 2))
+                    cv2.polylines(canvas, [tri_pts], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                    cv2.polylines(mask, [tri_pts], isClosed=True, color=255, thickness=thickness)
+                    cls._last_line = None
+                    return "TRIANGULO"
+
+                # QUADRADO, RETANGULO OU LOSANGO (4 vertices e nao-circular)
+                if num_verts == 4 and circularity < 0.89:
+                    x, y, bw, bh = cv2.boundingRect(approx)
+                    approx_area = cv2.contourArea(approx)
+                    fill_ratio = approx_area / max(float(bw * bh), 1.0)
+                    cx, cy = x + bw // 2, y + bh // 2
+
+                    # Losango (orientado nas diagonais: ocupa ~50% da bounding box)
+                    if fill_ratio < 0.66:
+                        diamond = np.array(
+                            [[cx, y], [x + bw, cy], [cx, y + bh], [x, cy]], dtype=np.int32
+                        ).reshape((-1, 1, 2))
+                        cv2.polylines(canvas, [diamond], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                        cv2.polylines(mask, [diamond], isClosed=True, color=255, thickness=thickness)
+                        cls._last_line = None
+                        return "LOSANGO"
+
+                    # Quadrado perfeito (proporcao largura/altura proxima de 1:1)
+                    aspect = bw / max(float(bh), 1.0)
+                    if 0.82 <= aspect <= 1.22:
+                        half = (bw + bh) // 4
+                        cv2.rectangle(
+                            canvas, (cx - half, cy - half), (cx + half, cy + half), color, thickness, cv2.LINE_AA
+                        )
+                        cv2.rectangle(mask, (cx - half, cy - half), (cx + half, cy + half), 255, thickness)
+                        cls._last_line = None
+                        return "QUADRADO"
+
+                    # Retangulo alinhado
+                    cv2.rectangle(canvas, (x, y), (x + bw, y + bh), color, thickness, cv2.LINE_AA)
+                    cv2.rectangle(mask, (x, y), (x + bw, y + bh), 255, thickness)
+                    cls._last_line = None
+                    return "RETANGULO"
+
+                # CIRCULO PERFEITO (alta circularidade ou muitos vertices suaves)
+                if circularity >= 0.84 or num_verts > 6:
+                    (ccx, ccy), enc_r = cv2.minEnclosingCircle(hull)
+                    area_r = math.sqrt(hull_area / math.pi)
+                    radius = max(12, int(round((enc_r + area_r) * 0.5)))
+                    center = (int(round(ccx)), int(round(ccy)))
+                    cv2.circle(canvas, center, radius, color, thickness, cv2.LINE_AA)
+                    cv2.circle(mask, center, radius, 255, thickness)
+                    cls._last_line = None
+                    return "CIRCULO"
+
+                # PENTAGONO / HEXAGONO (5 ou 6 vertices com quinas definidas)
+                if num_verts in (5, 6):
+                    cv2.polylines(canvas, [approx], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                    cv2.polylines(mask, [approx], isClosed=True, color=255, thickness=thickness)
+                    cls._last_line = None
+                    return "PENTAGONO" if num_verts == 5 else "HEXAGONO"
+
+        # Fallback: mantem o traco original (escrita livre, letras, numeros)
+        cls.draw_freehand(canvas, mask, stroke, color, thickness)
+        return "LIVRE"
+
+
 class SideMenu:
     """
     Menu Lateral Direito com Design Moderno (Glassmorphism + Cantos Arredondados):
     - 2 dedos (FREE)  -> Move livremente entre as opcoes (apenas efeito visual de hover).
-    - 3 dedos (CLICK) -> Clica para abrir/fechar opcoes, arrasta cor no Color Picker ou espessura no Slider.
+    - 3 dedos (CLICK) -> Clica nos botoes e arrasta a cor ou espessura.
     """
 
     PICKER_SIZE = 184
@@ -305,27 +594,28 @@ class SideMenu:
         self.val = 255
         self.brush_color: tuple[int, int, int] = (0, 0, 255)
         self.brush_thickness: int = 12
+        self.shape_assist_active: bool = True
 
-        # Dock flutuante no LADO DIREITO da tela (x = 1172..1264, centralizada em Y)
-        self.bar_rect = (1172, 165, 1264, 525)
-        self.btn_color_rect = (1182, 180, 1254, 276)
-        self.btn_size_rect = (1182, 294, 1254, 390)
-        self.btn_clear_rect = (1182, 408, 1254, 504)
+        # Dock flutuante no LADO DIREITO da tela (centralizada verticalmente)
+        self.bar_rect = (1172, 114, 1264, 580)
+        self.btn_color_rect = (1182, 128, 1254, 224)
+        self.btn_size_rect = (1182, 238, 1254, 334)
+        self.btn_snap_rect = (1182, 348, 1254, 444)
+        self.btn_clear_rect = (1182, 458, 1254, 554)
 
         # Popups abrem a ESQUERDA da dock direita
         self.active_panel: str | None = None  # None | 'COLOR' | 'SIZE'
 
-        self.color_panel_rect = (890, 165, 1158, 425)
-        self.sv_origin = (908, 222)   # Quadrado 184x184
-        self.hue_origin = (1108, 222)  # Barra Hue 26x184
+        self.color_panel_rect = (890, 128, 1158, 388)
+        self.sv_origin = (908, 185)
+        self.hue_origin = (1108, 185)
 
-        self.size_panel_rect = (880, 245, 1158, 425)
+        self.size_panel_rect = (880, 210, 1158, 390)
         self.slider_x1 = 906
         self.slider_x2 = 1132
-        self.slider_y = 320
+        self.slider_y = 285
         self.size_presets = [6, 12, 20, 30]
 
-        # Cache de mascaras arredondadas para renderizacao Glassmorphism ultra-rapida
         self._mask_cache: dict[tuple[int, int, int], np.ndarray] = {}
 
         # Pre-renderiza matrizes HSV do Color Picker estilo Photoshop
@@ -346,7 +636,6 @@ class SideMenu:
         self._rebuild_sv_square()
         self._update_bgr_from_hsv()
 
-        # Estados de interacao (Hover 2 dedos vs Clique 3 dedos)
         self.hovered_item: str | None = None
         self._was_clicking: bool = False
         self._last_btn_click_t: float = 0.0
@@ -453,29 +742,23 @@ class SideMenu:
         self._was_clicking = False
 
     def update_cursor(self, cx: int, cy: int, is_clicking: bool) -> str | None:
-        """
-        Atualiza o Menu Lateral:
-        - is_clicking == False (2 dedos): apenas atualiza o destaque de Hover (movimento livre!).
-        - is_clicking == True  (3 dedos):
-            * Nos botoes da dock: dispara clique unico na borda de subida (just_clicked).
-            * No Color Picker e Slider: permite clicar e arrastar suavemente com os 3 dedos!
-        """
         now = time.perf_counter()
         just_clicked = is_clicking and not self._was_clicking
         self._was_clicking = is_clicking
 
-        # Detecta qual elemento esta sob o cursor para efeito visual de hover
         self.hovered_item = None
         if self._in_rect(cx, cy, self.btn_color_rect, pad=4):
             self.hovered_item = "BTN_COLOR"
         elif self._in_rect(cx, cy, self.btn_size_rect, pad=4):
             self.hovered_item = "BTN_SIZE"
+        elif self._in_rect(cx, cy, self.btn_snap_rect, pad=4):
+            self.hovered_item = "BTN_SNAP"
         elif self._in_rect(cx, cy, self.btn_clear_rect, pad=4):
             self.hovered_item = "BTN_CLEAR"
         elif self.active_panel == "SIZE":
             for idx, preset in enumerate(self.size_presets):
                 px = 918 + idx * 62
-                py = 380
+                py = 345
                 if math.hypot(cx - px, cy - py) <= 22:
                     self.hovered_item = f"PRESET_{preset}"
                     break
@@ -483,7 +766,7 @@ class SideMenu:
         if not is_clicking:
             return None
 
-        # 1) Clique / Arraste continuo dentro do Color Picker estilo Photoshop (3 dedos ativos)
+        # 1) Clique / Arraste continuo dentro do Color Picker estilo Photoshop (3 dedos)
         if self.active_panel == "COLOR" and self._in_rect(cx, cy, self.color_panel_rect, pad=10):
             sx0, sy0 = self.sv_origin
             hx0, hy0 = self.hue_origin
@@ -507,7 +790,7 @@ class SideMenu:
 
             return None
 
-        # 2) Clique / Arraste dentro do Painel de Grossura do Traco (3 dedos ativos)
+        # 2) Clique / Arraste dentro do Painel de Grossura do Traco (3 dedos)
         if self.active_panel == "SIZE" and self._in_rect(cx, cy, self.size_panel_rect, pad=10):
             if (self.slider_x1 - 12) <= cx <= (self.slider_x2 + 12) and (self.slider_y - 26) <= cy <= (self.slider_y + 26):
                 ratio = (cx - self.slider_x1) / float(self.slider_x2 - self.slider_x1)
@@ -518,13 +801,13 @@ class SideMenu:
             if just_clicked:
                 for idx, preset in enumerate(self.size_presets):
                     px = 918 + idx * 62
-                    py = 380
+                    py = 345
                     if math.hypot(cx - px, cy - py) <= 24:
                         self.brush_thickness = preset
                         return "SIZE_CHANGED"
             return None
 
-        # 3) Clique unico (just_clicked com 3 dedos) nos botoes da Dock Lateral Direita
+        # 3) Clique unico (3 dedos) nos cards da Dock Lateral Direita
         if just_clicked and (now - self._last_btn_click_t) >= 0.30:
             if self.hovered_item == "BTN_COLOR":
                 self._last_btn_click_t = now
@@ -536,6 +819,12 @@ class SideMenu:
                 self.active_panel = None if self.active_panel == "SIZE" else "SIZE"
                 return "TOGGLE_SIZE"
 
+            if self.hovered_item == "BTN_SNAP":
+                self._last_btn_click_t = now
+                self.shape_assist_active = not self.shape_assist_active
+                self.active_panel = None
+                return "TOGGLE_SNAP"
+
             if self.hovered_item == "BTN_CLEAR":
                 self._last_btn_click_t = now
                 self._clear_flash_until = now + 0.32
@@ -545,7 +834,6 @@ class SideMenu:
         return None
 
     def draw(self, frame: np.ndarray) -> None:
-        """Renderiza a Dock Lateral Direita em vidro fosco (Glassmorphism) e os popups modernos."""
         now = time.perf_counter()
 
         # Container principal da Dock Direita
@@ -566,7 +854,6 @@ class SideMenu:
         ccx, ccy = (bx1 + bx2) // 2, by1 + 36
         cv2.circle(frame, (ccx, ccy), 22, (235, 235, 245), 2, cv2.LINE_AA)
         cv2.circle(frame, (ccx, ccy), 18, self.brush_color, cv2.FILLED, cv2.LINE_AA)
-        # Brilho especular suave no topo da esfera de cor
         cv2.circle(frame, (ccx - 6, ccy - 6), 4, (255, 255, 255), cv2.FILLED, cv2.LINE_AA)
         cv2.putText(frame, "COR", (ccx - 17, by2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 240, 250), 1, cv2.LINE_AA)
 
@@ -589,7 +876,25 @@ class SideMenu:
         (tw, _), _ = cv2.getTextSize(size_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
         cv2.putText(frame, size_lbl, (scx - tw // 2, sy2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 240, 250), 1, cv2.LINE_AA)
 
-        # --- CARD 3: LIMPAR TUDO (ICONE VETORIAL DE LIXEIRA) ---
+        # --- CARD 3: FORMAS INTELIGENTES (ESTILO CANVA ON/OFF) ---
+        g_hover = self.hovered_item == "BTN_SNAP"
+        g_on = self.shape_assist_active
+        g_tint = (42, 115, 62) if g_on else (46, 50, 66) if g_hover else (34, 36, 46)
+        self._draw_rounded_fill(frame, self.btn_snap_rect, radius=16, color=g_tint, alpha=0.92)
+        g_border = (170, 255, 190) if (g_on and g_hover) else (120, 220, 145) if g_on else (185, 195, 220) if g_hover else (68, 72, 90)
+        self._draw_rounded_border(frame, self.btn_snap_rect, radius=16, color=g_border, thickness=2 if (g_on or g_hover) else 1)
+
+        gx1, gy1, gx2, gy2 = self.btn_snap_rect
+        gcx, gcy = (gx1 + gx2) // 2, gy1 + 34
+        icon_g_col = (240, 255, 245) if g_on else (160, 168, 185)
+        tri_pts = np.array([[gcx - 14, gcy + 11], [gcx - 2, gcy - 12], [gcx + 10, gcy + 11]], dtype=np.int32)
+        cv2.polylines(frame, [tri_pts], isClosed=True, color=icon_g_col, thickness=2, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (gcx + 8, gcy - 3), 8, icon_g_col, 2, cv2.LINE_AA)
+        snap_lbl = "FORMAS" if g_on else "LIVRE"
+        (tw_g, _), _ = cv2.getTextSize(snap_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.43, 1)
+        cv2.putText(frame, snap_lbl, (gcx - tw_g // 2, gy2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, icon_g_col, 1, cv2.LINE_AA)
+
+        # --- CARD 4: LIMPAR TUDO (ICONE VETORIAL DE LIXEIRA) ---
         cl_hover = self.hovered_item == "BTN_CLEAR"
         flashing = now < self._clear_flash_until
         cl_tint = (90, 95, 235) if flashing else (52, 44, 92) if cl_hover else (38, 34, 54)
@@ -600,10 +905,8 @@ class SideMenu:
         cx1, cy1, cx2, cy2 = self.btn_clear_rect
         icx, icy = (cx1 + cx2) // 2, cy1 + 35
         icon_col = (255, 240, 240) if cl_hover else (190, 185, 255)
-        # Tampa e alca da lixeira
         cv2.line(frame, (icx - 13, icy - 10), (icx + 13, icy - 10), icon_col, 2, cv2.LINE_AA)
         cv2.rectangle(frame, (icx - 5, icy - 14), (icx + 5, icy - 10), icon_col, 1, cv2.LINE_AA)
-        # Corpo da lixeira
         trash_body = np.array(
             [[icx - 10, icy - 8], [icx + 10, icy - 8], [icx + 8, icy + 13], [icx - 8, icy + 13]],
             dtype=np.int32,
@@ -613,7 +916,7 @@ class SideMenu:
         cv2.line(frame, (icx + 3, icy - 3), (icx + 3, icy + 8), icon_col, 1, cv2.LINE_AA)
         cv2.putText(frame, "LIMPAR", (icx - 27, cy2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 235, 245), 1, cv2.LINE_AA)
 
-        # --- POPUP 1: SELETOR DE CORES HSV (ESTILO PHOTOSHOP, A ESQUERDA DA DOCK) ---
+        # --- POPUP 1: SELETOR DE CORES HSV (ESTILO PHOTOSHOP) ---
         if self.active_panel == "COLOR":
             px1, py1, px2, py2 = self.color_panel_rect
             self._draw_rounded_fill(
@@ -642,12 +945,10 @@ class SideMenu:
                 cv2.LINE_AA,
             )
 
-            # Pilula arredondada de amostra da cor atual
             pill_rect = (px2 - 64, py1 + 14, px2 - 18, py1 + 42)
             self._draw_rounded_fill(frame, pill_rect, radius=10, color=self.brush_color, alpha=1.0)
             self._draw_rounded_border(frame, pill_rect, radius=10, color=(235, 235, 245), thickness=1)
 
-            # Quadrado 2D Saturacao x Brilho
             sx0, sy0 = self.sv_origin
             frame[sy0 : sy0 + self.PICKER_SIZE, sx0 : sx0 + self.PICKER_SIZE] = self._sv_bgr_cache
             cv2.rectangle(
@@ -665,7 +966,6 @@ class SideMenu:
             cv2.circle(frame, (sel_x, sel_y), 8, (0, 0, 0), 2, cv2.LINE_AA)
             cv2.circle(frame, (sel_x, sel_y), 7, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # Barra Vertical de Matiz (Hue / Arco-iris)
             hx0, hy0 = self.hue_origin
             frame[hy0 : hy0 + self.PICKER_SIZE, hx0 : hx0 + self.HUE_BAR_W] = self._hue_bar_bgr
             cv2.rectangle(
@@ -716,7 +1016,6 @@ class SideMenu:
                 cv2.LINE_AA,
             )
 
-            # Trilho capsula do Slider Horizontal
             cv2.line(
                 frame,
                 (self.slider_x1, self.slider_y),
@@ -738,10 +1037,9 @@ class SideMenu:
             cv2.circle(frame, (knob_x, self.slider_y), 12, (255, 255, 255), cv2.FILLED, cv2.LINE_AA)
             cv2.circle(frame, (knob_x, self.slider_y), 8, self.brush_color, cv2.FILLED, cv2.LINE_AA)
 
-            # Presets circulares inferiores
             for idx, preset in enumerate(self.size_presets):
                 cx_p = 918 + idx * 62
-                cy_p = 380
+                cy_p = 345
                 is_curr = abs(self.brush_thickness - preset) <= 1
                 is_hov = self.hovered_item == f"PRESET_{preset}"
                 bg_c = (65, 72, 95) if is_curr else (50, 55, 72) if is_hov else (36, 38, 48)
@@ -762,13 +1060,21 @@ def main() -> None:
     tracker = HandTracker(max_hands=1)
     menu = SideMenu()
 
-    # Canvas colorido + mascara binaria 2D sincronizada (fusao em 0.03 ms via cv2.copyTo!)
-    canvas = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    canvas_mask = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8)
+    # Camada Definitiva (formas corrigidas e desenhos consolidados) + Camada Temporaria (rascunho atual)
+    permanent_canvas = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    permanent_mask = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8)
+
+    temp_canvas = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    temp_mask = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8)
+    current_stroke: list[tuple[int, int]] = []
+    has_temp_drawing = False
+    snapped_hold_lock = False
 
     prev_draw_pt: tuple[int, int] | None = None
     prev_erase_pt: tuple[int, int] | None = None
     smooth_pt: tuple[float, float] | None = None
+    hold_anchor_pt: tuple[int, int] | None = None
+    hold_since_t: float = 0.0
 
     last_submitted_frame_id = -1
     last_processed_seq = -1
@@ -776,10 +1082,34 @@ def main() -> None:
     non_draw_streak = 0
 
     mode_label = "AGUARDANDO MAO"
+    shape_badge_text = ""
+    shape_badge_until = 0.0
     overlay_cursor: tuple[str, tuple[int, int], int] | None = None
 
     fps_smooth = 30.0
     prev_time = time.perf_counter()
+
+    def finalize_current_stroke() -> None:
+        nonlocal has_temp_drawing, prev_draw_pt, hold_anchor_pt, shape_badge_text, shape_badge_until
+        if current_stroke:
+            detected = ShapeRecognizer.process_and_draw(
+                permanent_canvas,
+                permanent_mask,
+                current_stroke,
+                menu.brush_color,
+                menu.brush_thickness,
+                menu.shape_assist_active,
+            )
+            if detected not in ("NONE", "LIVRE"):
+                shape_badge_text = f"Forma: {detected}"
+                shape_badge_until = time.perf_counter() + 1.4
+            current_stroke.clear()
+        if has_temp_drawing:
+            temp_canvas.fill(0)
+            temp_mask.fill(0)
+            has_temp_drawing = False
+        prev_draw_pt = None
+        hold_anchor_pt = None
 
     try:
         while True:
@@ -811,8 +1141,6 @@ def main() -> None:
                         )
                     sx, sy = int(smooth_pt[0]), int(smooth_pt[1])
 
-                    # Se estiver sobre o Menu Lateral e o mindinho levantar junto sem querer no clique de 3 dedos,
-                    # trata como clique no menu em vez de borracha!
                     if gesture == "ERASE" and menu.is_over_ui(sx, sy, pad=14):
                         cx_ui = int((lms2d[8].x + lms2d[12].x) * 0.5 * FRAME_WIDTH)
                         cy_ui = int((lms2d[8].y + lms2d[12].y) * 0.5 * FRAME_HEIGHT)
@@ -827,7 +1155,8 @@ def main() -> None:
                         prev_erase_pt = None
 
                         if menu.is_over_ui(sx, sy):
-                            prev_draw_pt = None
+                            finalize_current_stroke()
+                            snapped_hold_lock = False
                             mode_label = "MENU (2 dedos mover | 3 dedos clicar)"
                             overlay_cursor = ("FREE", (sx, sy), 10)
                         else:
@@ -839,37 +1168,68 @@ def main() -> None:
                                 if gesture == "DRAW_PEN"
                                 else "DESENHO (Indicador Livre 3D)"
                             )
-                            if prev_draw_pt is not None and math.hypot(sx - prev_draw_pt[0], sy - prev_draw_pt[1]) > 180:
-                                prev_draw_pt = None
-
-                            color = menu.brush_color
                             thick = menu.brush_thickness
 
-                            if prev_draw_pt is None:
-                                cv2.circle(canvas, (sx, sy), max(1, thick // 2), color, cv2.FILLED)
-                                cv2.circle(canvas_mask, (sx, sy), max(1, thick // 2), 255, cv2.FILLED)
+                            # Se acabou de converter a forma segurando o dedo parado (estilo Canva),
+                            # aguarda o usuario mover o dedo (> 28px) para iniciar um novo traco
+                            if snapped_hold_lock:
+                                if hold_anchor_pt is None or math.hypot(sx - hold_anchor_pt[0], sy - hold_anchor_pt[1]) > 28:
+                                    snapped_hold_lock = False
+                                    hold_anchor_pt = (sx, sy)
+                                    hold_since_t = now
+                                overlay_cursor = ("DRAW", (sx, sy), max(6, thick // 2))
                             else:
-                                cv2.line(canvas, prev_draw_pt, (sx, sy), color, thick)
-                                cv2.line(canvas_mask, prev_draw_pt, (sx, sy), 255, thick)
+                                if prev_draw_pt is not None and math.hypot(sx - prev_draw_pt[0], sy - prev_draw_pt[1]) > 180:
+                                    finalize_current_stroke()
 
-                            prev_draw_pt = (sx, sy)
-                            overlay_cursor = ("DRAW", (sx, sy), max(6, thick // 2))
+                                color = menu.brush_color
+                                current_stroke.append((sx, sy))
+                                has_temp_drawing = True
+
+                                if prev_draw_pt is None:
+                                    cv2.circle(temp_canvas, (sx, sy), max(1, thick // 2), color, cv2.FILLED)
+                                    cv2.circle(temp_mask, (sx, sy), max(1, thick // 2), 255, cv2.FILLED)
+                                    hold_anchor_pt = (sx, sy)
+                                    hold_since_t = now
+                                else:
+                                    cv2.line(temp_canvas, prev_draw_pt, (sx, sy), color, thick, cv2.LINE_AA)
+                                    cv2.line(temp_mask, prev_draw_pt, (sx, sy), 255, thick)
+
+                                    # Gatilho Estilo Canva: se segurar o dedo parado no final do traco por 0.42s,
+                                    # converte a linha/forma/seta imediatamente na tela!
+                                    if hold_anchor_pt is None or math.hypot(sx - hold_anchor_pt[0], sy - hold_anchor_pt[1]) > 11:
+                                        hold_anchor_pt = (sx, sy)
+                                        hold_since_t = now
+                                    elif (
+                                        menu.shape_assist_active
+                                        and len(current_stroke) >= 14
+                                        and (now - hold_since_t) >= HOLD_SNAP_SEC
+                                    ):
+                                        last_pt = (sx, sy)
+                                        finalize_current_stroke()
+                                        snapped_hold_lock = True
+                                        hold_anchor_pt = last_pt
+
+                                if not snapped_hold_lock:
+                                    prev_draw_pt = (sx, sy)
+                                overlay_cursor = ("DRAW", (sx, sy), max(6, thick // 2))
 
                     # 2) MODO BORRACHA: 4 dedos estendidos (fora do menu)
                     elif gesture == "ERASE":
                         non_draw_streak += 1
                         if non_draw_streak >= 2 or prev_draw_pt is None:
+                            finalize_current_stroke()
+                            snapped_hold_lock = False
                             menu.reset_interaction()
                             mode_label = "BORRACHA (4 Dedos)"
-                            prev_draw_pt = None
                             ex, ey = int(raw_x), int(raw_y)
 
-                            cv2.circle(canvas, (ex, ey), ERASER_RADIUS, (0, 0, 0), cv2.FILLED)
-                            cv2.circle(canvas_mask, (ex, ey), ERASER_RADIUS, 0, cv2.FILLED)
+                            cv2.circle(permanent_canvas, (ex, ey), ERASER_RADIUS, (0, 0, 0), cv2.FILLED)
+                            cv2.circle(permanent_mask, (ex, ey), ERASER_RADIUS, 0, cv2.FILLED)
 
                             if prev_erase_pt is not None:
-                                cv2.line(canvas, prev_erase_pt, (ex, ey), (0, 0, 0), ERASER_RADIUS * 2)
-                                cv2.line(canvas_mask, prev_erase_pt, (ex, ey), 0, ERASER_RADIUS * 2)
+                                cv2.line(permanent_canvas, prev_erase_pt, (ex, ey), (0, 0, 0), ERASER_RADIUS * 2)
+                                cv2.line(permanent_mask, prev_erase_pt, (ex, ey), 0, ERASER_RADIUS * 2)
 
                             prev_erase_pt = (ex, ey)
                             overlay_cursor = ("ERASE", (ex, ey), ERASER_RADIUS)
@@ -878,19 +1238,25 @@ def main() -> None:
                     elif gesture in ("FREE", "CLICK"):
                         non_draw_streak += 1
                         if non_draw_streak >= 2 or prev_draw_pt is None:
+                            finalize_current_stroke()
+                            snapped_hold_lock = False
                             is_clicking = gesture == "CLICK"
                             mode_label = "CLIQUE MENU (3 Dedos)" if is_clicking else "LIVRE (2 Dedos)"
-                            prev_draw_pt = None
                             prev_erase_pt = None
 
                             overlay_cursor = ("CLICK" if is_clicking else "FREE", (sx, sy), 11)
 
                             action = menu.update_cursor(sx, sy, is_clicking=is_clicking)
                             if action == "CLEAR_ALL":
-                                canvas.fill(0)
-                                canvas_mask.fill(0)
+                                permanent_canvas.fill(0)
+                                permanent_mask.fill(0)
+                                temp_canvas.fill(0)
+                                temp_mask.fill(0)
+                                current_stroke.clear()
+                                has_temp_drawing = False
+                                ShapeRecognizer._last_line = None
 
-                    # Mao fechada / soltou a pinca -> pausa o traco
+                    # Mao fechada / soltou a pinca -> pausa e consolida/corrige o traco
                     else:
                         prev_erase_pt = None
                         menu.reset_interaction()
@@ -898,8 +1264,9 @@ def main() -> None:
                         if prev_draw_pt is not None and (now - last_draw_seen_t) <= DRAW_GRACE_SEC and non_draw_streak < 3:
                             overlay_cursor = ("DRAW", prev_draw_pt, max(6, menu.brush_thickness // 2))
                         else:
+                            finalize_current_stroke()
+                            snapped_hold_lock = False
                             mode_label = "LIVRE / PAUSADO"
-                            prev_draw_pt = None
                             overlay_cursor = ("FREE", (int(raw_x), int(raw_y)), 8)
                 else:
                     prev_erase_pt = None
@@ -907,13 +1274,16 @@ def main() -> None:
                     if prev_draw_pt is not None and (now - last_draw_seen_t) <= DRAW_GRACE_SEC:
                         overlay_cursor = ("DRAW", prev_draw_pt, max(6, menu.brush_thickness // 2))
                     else:
+                        finalize_current_stroke()
+                        snapped_hold_lock = False
                         mode_label = "AGUARDANDO MAO"
-                        prev_draw_pt = None
                         smooth_pt = None
                         overlay_cursor = None
 
-            # Fusao ultra-rapida O(1) in-place (0.03 ms/frame)
-            cv2.copyTo(canvas, canvas_mask, frame)
+            # Fusao ultra-rapida O(1) do permanent_canvas + rascunho temp_canvas (0.05 ms/frame)
+            cv2.copyTo(permanent_canvas, permanent_mask, frame)
+            if has_temp_drawing:
+                cv2.copyTo(temp_canvas, temp_mask, frame)
 
             # Desenha esqueleto da mao, Menu Lateral Direito e cursor ativo
             tracker.draw_landmarks_fast(frame, lms2d)
@@ -928,7 +1298,6 @@ def main() -> None:
                     cv2.circle(frame, (cx, cy), rad, (255, 255, 255), 2, cv2.LINE_AA)
                     cv2.circle(frame, (cx, cy), 3, menu.brush_color, cv2.FILLED, cv2.LINE_AA)
                 elif kind == "CLICK":
-                    # Feedback visual nitido de clique pressionado (3 dedos)
                     cv2.circle(frame, (cx, cy), rad + 4, (0, 255, 180), 2, cv2.LINE_AA)
                     cv2.circle(frame, (cx, cy), 6, (0, 255, 180), cv2.FILLED, cv2.LINE_AA)
                 elif kind == "ERASE":
@@ -949,6 +1318,18 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
+
+            if now < shape_badge_until:
+                cv2.putText(
+                    frame,
+                    shape_badge_text,
+                    (20, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.70,
+                    (0, 255, 200),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow(window_name, frame)
 
